@@ -36,7 +36,7 @@ from tqdm import tqdm
 # Prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a synthetic dataset generator. Your job is to produce ONE high-quality SINGLE-TURN tool-calling sample for an Android assistant.
+SYSTEM_PROMPT = """You are a synthetic dataset generator. Your job is to produce ONE high-quality tool-calling sample for an Android assistant.
 
 ⚠️ CRITICAL: You MUST strictly follow the Intent given below. Do NOT drift to an unrelated scenario.
 
@@ -47,10 +47,10 @@ The output MUST be valid JSON matching this EXACT format:
   "expected_outcome": "<one-sentence description of what the assistant accomplishes>",
   "chatbot_role": "<short role description>",
   "turns": [
-    {"role": "user", "content": "<user's full request — all info needed, no missing context>"},
+    {"role": "user", "content": "<user's full self-contained request — includes time, name, value, etc. — no missing info>"},
     {
       "role": "assistant",
-      "content": "<brief reasoning and final natural-language answer>",
+      "content": "<brief reasoning, e.g. 'Checking your battery level now.'>",
       "tools_called": [
         {
           "name": "<exact tool name from AVAILABLE TOOLS>",
@@ -59,25 +59,28 @@ The output MUST be valid JSON matching this EXACT format:
           "output": "<realistic result as a JSON-encoded string>"
         }
       ]
-    }
+    },
+    {"role": "assistant", "content": "<natural-language summary that REFERENCES the actual values returned by the tool — e.g. 'Your battery is at 23%. I'd suggest charging soon.' — NO tools_called here>"}
   ]
 }
 
 HARD REQUIREMENTS:
-1. EXACTLY 2 turns: one user, then one assistant. No clarification turn. No follow-up.
-2. The user's single message contains EVERYTHING the assistant needs (specific time, contact name, value, etc.). The assistant does NOT ask back.
-3. The assistant turn MUST contain `tools_called` with at least 1 tool call.
-4. role is ONLY "user" or "assistant". NEVER "system", NEVER "tool".
-5. Every tool name MUST appear in AVAILABLE TOOLS.
-6. `input_parameters` is a JSON OBJECT (dict), NOT a string.
-7. `output` is a JSON-encoded STRING simulating what the tool would return.
-8. Required parameters MUST be present; do NOT include keys not in the tool's schema.
-9. Use the Target tools; do NOT substitute unrelated tools.
-10. For inter-group scenarios: tools from EACH listed group must be called. Parallel calls in the same assistant turn are fine and encouraged.
+1. EXACTLY 3 turns. NOT 2, NOT 4. Three turns total: user → assistant (with tool calls) → assistant (summary, NO tools_called).
+2. The user's single message contains EVERYTHING needed (specific time, contact, value). The assistant does NOT ask back.
+3. The FIRST assistant turn MUST contain `tools_called` with at least 1 tool call.
+4. The LAST assistant turn MUST NOT contain `tools_called`. Its content is a natural-language summary that references the actual values from the tool output (don't invent new ones).
+5. Do NOT add a 4th turn (no follow-up user, no extra assistant). The summary in turn 3 ends the conversation.
+6. role is ONLY "user" or "assistant". NEVER "system", NEVER "tool".
+7. Every tool name MUST appear in AVAILABLE TOOLS.
+8. `input_parameters` is a JSON OBJECT (dict), NOT a string.
+9. `output` is a JSON-encoded STRING simulating what the tool would return.
+10. Required parameters MUST be present; do NOT include keys not in the tool's schema.
+11. Use the Target tools; do NOT substitute unrelated tools.
+12. For inter-group scenarios: tools from EACH listed group must be called. Parallel calls in the same first-assistant turn are fine.
 
 VARIETY:
 - Vary the user's opening phrasing. Do NOT always start with "My", "Can you", "Please".
-- Vary the assistant's phrasing.
+- Vary the summary's opening — sometimes confirm action, sometimes lead with the value.
 - Vary argument values — use realistic but DIFFERENT specifics each time.
 
 Output ONLY the JSON object. No prose, no markdown fences.
@@ -124,7 +127,9 @@ SCENARIO (match this exactly — do not drift to a different topic):
 - Variety nudge: {variety}
 
 The user's SINGLE message must be self-contained — include all specifics (time, name, value) so the assistant doesn't need to ask back.
-The assistant responds in ONE turn with the tool call(s) and a brief natural-language answer.
+The assistant responds in TWO consecutive turns:
+  (a) first assistant turn carries the tool call(s) with brief reasoning,
+  (b) second assistant turn is a natural-language summary that references the actual values from the tool output (no new info).
 
 Generate the sample now. Output ONLY the JSON object."""
 
@@ -237,9 +242,10 @@ def validate_sample(sample, schema_index, target_tools=None, strict_targets=True
     when `seed` has a non-empty `groups_required` (inter-group runs).
     """
     seed = seed or {}
-    requires_clar = seed.get("requires_clarification", False)   # single-turn default
-    min_tool_calls = int(seed.get("min_tool_calls", 1))         # single-turn default
-    min_turns_req  = int(seed.get("min_turns", 2))              # single-turn default
+    requires_clar = seed.get("requires_clarification", False)   # no clarification
+    min_tool_calls = int(seed.get("min_tool_calls", 1))         # ≥1 tool call
+    min_turns_req  = int(seed.get("min_turns", 3))              # 3-turn default
+    max_turns_req  = int(seed.get("max_turns", min_turns_req))  # strict upper bound (default = min_turns)
     groups_req     = set(seed.get("groups_required") or [])
 
     # Detect mode for conditional rules below.
@@ -261,9 +267,11 @@ def validate_sample(sample, schema_index, target_tools=None, strict_targets=True
     if is_multi_turn and turns[-1].get("tools_called"):
         return False, "last assistant turn must not have tools_called (multi-turn mode)"
 
-    # ---- min turns ----
+    # ---- min/max turns ----
     if len(turns) < min_turns_req:
         return False, f"only {len(turns)} turns (need >={min_turns_req})"
+    if len(turns) > max_turns_req:
+        return False, f"{len(turns)} turns (max allowed {max_turns_req})"
 
     # ---- per-turn validation + collect tool calls ----
     n_tool_calls = 0
@@ -308,9 +316,9 @@ def validate_sample(sample, schema_index, target_tools=None, strict_targets=True
                 if unknown:
                     return False, f"turn {i} tc{j} '{name}': unknown args {unknown}"
 
-    # ---- ≥2 user turns (only in multi-turn mode) ----
-    if is_multi_turn and user_count < 2:
-        return False, f"only {user_count} user turn(s) (need >=2 in multi-turn mode)"
+    # ---- ≥2 user turns (only when clarification flow is required) ----
+    if requires_clar and user_count < 2:
+        return False, f"only {user_count} user turn(s) (need >=2 with clarification)"
 
     # ---- multi-tool call requirement ----
     if n_tool_calls < min_tool_calls:
